@@ -14,8 +14,33 @@ done the way I actually work — a real module, preserved behavior, verified out
 - [x] Day 2 — quote loop + latency percentiles (p50/p99) + Python-vs-Rust bench
       (below). Also fixed Day-1 semantics: timing now wraps the **full body**
       like the Python original — Day 1 measured only time-to-headers.
-- [ ] Typed response structs (serde), route-plan parsing
+- [x] Day 3 — typed deserialization (serde structs, no more dynamic JSON),
+      implied price, route-plan parsing and route churn (findings below)
 - [ ] Token basket + CSV output, CLI args (clap)
+
+## Day 3 finding: the route churns under identical requests
+
+20 back-to-back quotes for the *same* request ($100 USDC → wSOL, seconds apart)
+returned **5 distinct routes**:
+
+```
+ 12x  HumidiFi (100%)
+  3x  SolFi V2 (100%)
+  3x  Quantum (100%)
+  1x  Scorch (100%)
+  1x  Quantum (100%) → Scorch (100%)
+```
+
+Implied price stayed tight across all of them — mean **$75.8028/SOL**, range
+$75.8015–$75.8082, spread **0.009%** — so the venue changed far more than the
+price did. That is the point of tracking route churn separately from price:
+*the fill you priced is not necessarily the fill you get*, even when the number
+looks stable. The Python monitor tracks the same metric; this port reproduces it.
+
+Amounts arrive as JSON **strings**, not numbers — a `u64` lamport amount can
+exceed JavaScript's safe integer range, so the API quotes them to keep full
+precision. Parsing them explicitly (rather than letting them land in a float)
+is the correctness detail a dynamic-JSON version hides.
 
 ## Python vs Rust — same measurement, same wire
 
