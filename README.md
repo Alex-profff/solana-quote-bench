@@ -16,7 +16,9 @@ done the way I actually work — a real module, preserved behavior, verified out
       like the Python original — Day 1 measured only time-to-headers.
 - [x] Day 3 — typed deserialization (serde structs, no more dynamic JSON),
       implied price, route-plan parsing and route churn (findings below)
-- [ ] Token basket + CSV output, CLI args (clap)
+- [x] Day 4 — optional CSV export of each quote (latency, implied price, route)
+      so a run can be inspected after the fact
+- [ ] Token basket, CLI args (clap)
 
 ## Day 3 finding: the route churns under identical requests
 
@@ -68,5 +70,6 @@ versions disagreed* is the exercise.
 
 ```
 cargo run -- 30                  # 30 quotes, prints percentiles
+cargo run -- 30 out.csv          # ...and write per-quote rows to out.csv
 python bench/bench_python.py 30  # same measurement, Python side
 ```

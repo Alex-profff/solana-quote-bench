@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-// Day 3 of the Rust port: typed deserialization instead of dynamic JSON,
-// plus the two things the Python collector actually derives from a quote —
-// implied price and which route the fill would take.
+// Day 4 of the Rust port: optionally persist each quote to CSV. A benchmark
+// run you can't inspect afterwards isn't really a measurement — so the
+// per-request records (latency, implied price, route) now survive the run.
 //
 // Timing note (Day 2): `send()` returns at response headers, so the clock
 // wraps send + full body parse to match the Python original (requests.get).
@@ -15,9 +17,6 @@ const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC_DECIMALS: u32 = 6;
 const WSOL_DECIMALS: u32 = 9;
 
-// Jupiter sends amounts as JSON *strings*, not numbers: a u64 lamport amount
-// can exceed JavaScript's safe integer range, so the API keeps full precision
-// by quoting them. We parse them explicitly rather than trusting a float.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteResponse {
@@ -37,13 +36,11 @@ struct RoutePlanStep {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SwapInfo {
-    // Not every venue reports a label — Option makes "missing" a case the
-    // compiler forces us to handle, instead of a runtime surprise.
     label: Option<String>,
 }
 
 impl QuoteResponse {
-    /// USDC paid per whole SOL received — the same implied price the Python
+    /// USDC paid per whole SOL received — the implied price the Python
     /// collector stores for cross-source reconciliation.
     fn implied_price_usd(&self) -> Result<f64, std::num::ParseIntError> {
         let usdc = self.in_amount.parse::<u64>()? as f64 / 10f64.powi(USDC_DECIMALS as i32);
@@ -51,7 +48,6 @@ impl QuoteResponse {
         Ok(usdc / sol)
     }
 
-    /// "Meteora DLMM → Whirlpool (50%)" — a stable signature for churn counting.
     fn route_signature(&self) -> String {
         self.route_plan
             .iter()
@@ -60,8 +56,32 @@ impl QuoteResponse {
                 format!("{label} ({}%)", step.percent)
             })
             .collect::<Vec<_>>()
-            .join(" → ")
+            .join(" -> ")
     }
+}
+
+/// One quote's outcome, kept so the run can be written out and re-checked.
+struct Record {
+    idx: usize,
+    latency_ms: u128,
+    price: Option<f64>,
+    route: String,
+    ok: bool,
+}
+
+fn write_csv(path: &str, records: &[Record]) -> std::io::Result<()> {
+    let mut w = BufWriter::new(File::create(path)?);
+    writeln!(w, "idx,latency_ms,price_usd,route,ok")?;
+    for r in records {
+        let price = r.price.map(|p| format!("{p:.6}")).unwrap_or_default();
+        // route can contain commas — wrap it in quotes so the CSV stays valid
+        writeln!(
+            w,
+            "{},{},{},\"{}\",{}",
+            r.idx, r.latency_ms, price, r.route, r.ok
+        )?;
+    }
+    Ok(())
 }
 
 fn percentile(sorted: &[u128], p: f64) -> u128 {
@@ -73,10 +93,12 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // usage: solana-quote-bench [n_requests] [out.csv]
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    let csv_path = std::env::args().nth(2);
 
     let amount: u64 = 100_000_000; // $100 in USDC atomic units
     let url = format!(
@@ -89,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("solana-quote-bench: {n} Jupiter quotes ($100 USDC -> wSOL)\n");
 
+    let mut records: Vec<Record> = Vec::with_capacity(n);
     let mut latencies: Vec<u128> = Vec::with_capacity(n);
     let mut prices: Vec<f64> = Vec::with_capacity(n);
     let mut routes: HashMap<String, usize> = HashMap::new();
@@ -106,16 +129,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(quote) => {
                 let price = quote.implied_price_usd()?;
+                let route = quote.route_signature();
                 latencies.push(ms);
                 prices.push(price);
-                *routes.entry(quote.route_signature()).or_insert(0) += 1;
-                println!(
-                    "  #{i:02}  {ms:>5} ms   ${price:>8.4}/SOL   impact {}%",
-                    quote.price_impact_pct
-                );
+                *routes.entry(route.clone()).or_insert(0) += 1;
+                records.push(Record { idx: i, latency_ms: ms, price: Some(price), route, ok: true });
+                println!("  #{i:02}  {ms:>5} ms   ${price:>8.4}/SOL   impact {}%", quote.price_impact_pct);
             }
             Err(e) => {
                 failures += 1;
+                records.push(Record { idx: i, latency_ms: ms, price: None, route: String::new(), ok: false });
                 println!("  #{i:02}  {ms:>5} ms   FAIL: {e}");
             }
         }
@@ -145,14 +168,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (hi - lo) / mean * 100.0);
     }
 
-    // Route churn: how often the best path changes between identical requests.
-    // Same metric the Python monitor tracks — a churny route means the fill you
-    // priced is not necessarily the fill you get.
     println!("\nroutes seen ({} distinct):", routes.len());
     let mut by_count: Vec<_> = routes.iter().collect();
     by_count.sort_by(|a, b| b.1.cmp(a.1));
     for (route, count) in by_count {
         println!("  {count:>3}x  {route}");
+    }
+
+    if let Some(path) = csv_path {
+        write_csv(&path, &records)?;
+        println!("\nwrote {} rows -> {path}", records.len());
     }
 
     Ok(())
