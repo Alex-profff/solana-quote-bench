@@ -18,6 +18,7 @@ done the way I actually work — a real module, preserved behavior, verified out
       implied price, route-plan parsing and route churn (findings below)
 - [x] Day 4 — optional CSV export of each quote (latency, implied price, route)
       so a run can be inspected after the fact
+- [x] Day 5 — unit tests for the percentile function (empty / single / p0-p50-p100)
 - [ ] Token basket, CLI args (clap)
 
 ## Day 3 finding: the route churns under identical requests

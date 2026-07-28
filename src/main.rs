@@ -182,3 +182,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentile_picks_expected_values() {
+        let xs = vec![10u128, 20, 30, 40, 50];
+        assert_eq!(percentile(&xs, 0.0), 10);
+        assert_eq!(percentile(&xs, 50.0), 30);
+        assert_eq!(percentile(&xs, 100.0), 50);
+    }
+
+    #[test]
+    fn percentile_of_empty_is_zero() {
+        assert_eq!(percentile(&[], 50.0), 0);
+    }
+
+    #[test]
+    fn percentile_of_single_element() {
+        assert_eq!(percentile(&[42u128], 99.0), 42);
+    }
+}
