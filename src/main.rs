@@ -204,4 +204,17 @@ mod tests {
     fn percentile_of_single_element() {
         assert_eq!(percentile(&[42u128], 99.0), 42);
     }
+
+    #[test]
+    fn implied_price_from_known_amounts() {
+        // 100 USDC in (6 decimals) for exactly 1 SOL out (9 decimals) => $100/SOL
+        let q = super::QuoteResponse {
+            in_amount: "100000000".to_string(),
+            out_amount: "1000000000".to_string(),
+            price_impact_pct: "0".to_string(),
+            route_plan: vec![],
+        };
+        let price = q.implied_price_usd().unwrap();
+        assert!((price - 100.0).abs() < 1e-9, "expected ~100, got {price}");
+    }
 }
