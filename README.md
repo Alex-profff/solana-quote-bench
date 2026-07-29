@@ -19,7 +19,10 @@ done the way I actually work — a real module, preserved behavior, verified out
 - [x] Day 4 — optional CSV export of each quote (latency, implied price, route)
       so a run can be inspected after the fact
 - [x] Day 5 — unit tests for the percentile function (empty / single / p0-p50-p100)
-- [ ] Token basket, CLI args (clap)
+- [x] Day 6 — known-answer test for `implied_price` (100 USDC → 1 SOL ⇒ $100/SOL)
+- [x] Day 7 — measure a **basket** (wSOL / JUP / BONK): per-token latency,
+      implied price, price impact and route churn (finding below)
+- [ ] CLI args (clap), configurable basket / notional
 
 ## Day 3 finding: the route churns under identical requests
 
@@ -67,10 +70,30 @@ Python collector's semantics, verified on the same wire), not a speed claim.
 Day 1 accidentally measured something different — catching *why the two
 versions disagreed* is the exercise.
 
+## Day 7 finding: the cost lives in the token, not the number
+
+Same $100 USDC notional, 12 quotes each, back-to-back:
+
+| token | mean price impact | implied-price spread | typical route |
+|-------|-------------------|----------------------|---------------|
+| wSOL  | 0.0034%           | 0.006%               | single-hop (Quantum / BisonFi / HumidiFi) |
+| JUP   | 0.34%             | 0.002%               | ZeroFi → Whirlpool (2 hops) |
+| BONK  | 0.41%             | 0.007%               | ZeroFi → Whirlpool (2 hops) |
+
+For the *same trade size* the quoted price impact is ~100x larger on the
+midcaps than on wSOL — and the majors fill in a single hop while both midcaps
+route through a second venue (Whirlpool). Latency is basically flat across all
+three (~145 ms p50), i.e. still network-bound, not token-bound.
+
+That is the whole point of measuring a basket rather than one pair: a single
+liquid pair reports a cost near zero and hides where execution actually gets
+expensive. The Python monitor tracks the basket for exactly this reason; the
+port now does too.
+
 ## Run
 
 ```
-cargo run -- 30                  # 30 quotes, prints percentiles
-cargo run -- 30 out.csv          # ...and write per-quote rows to out.csv
-python bench/bench_python.py 30  # same measurement, Python side
+cargo run -- 20                  # 20 quotes per token, per-token summary
+cargo run -- 20 out.csv          # ...and write every quote (with token) to out.csv
+python bench/bench_python.py 30  # single-pair (wSOL) Python latency bench, same wire
 ```

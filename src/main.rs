@@ -5,17 +5,32 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-// Day 4 of the Rust port: optionally persist each quote to CSV. A benchmark
-// run you can't inspect afterwards isn't really a measurement — so the
-// per-request records (latency, implied price, route) now survive the run.
+// Day 7 of the Rust port: measure a *basket*, not a single pair. The Python
+// monitor tracks execution cost across tokens of different liquidity — majors
+// quote tight, midcaps don't — so one pair hides the metric that matters.
+// Each token gets its own latency / implied-price / price-impact / route
+// summary from the same $100 USDC notional.
 //
 // Timing note (Day 2): `send()` returns at response headers, so the clock
 // wraps send + full body parse to match the Python original (requests.get).
 
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const WSOL: &str = "So11111111111111111111111111111111111111112";
 const USDC_DECIMALS: u32 = 6;
-const WSOL_DECIMALS: u32 = 9;
+
+/// A quote target: spend a fixed USDC notional to buy `symbol`.
+struct Token {
+    symbol: &'static str,
+    mint: &'static str,
+    decimals: u32,
+}
+
+// A major, a large-cap and a midcap — deliberately different liquidity so the
+// per-token spread/impact/route-churn actually diverge.
+const BASKET: &[Token] = &[
+    Token { symbol: "wSOL", mint: "So11111111111111111111111111111111111111112", decimals: 9 },
+    Token { symbol: "JUP",  mint: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", decimals: 6 },
+    Token { symbol: "BONK", mint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", decimals: 5 },
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,12 +55,12 @@ struct SwapInfo {
 }
 
 impl QuoteResponse {
-    /// USDC paid per whole SOL received — the implied price the Python
-    /// collector stores for cross-source reconciliation.
-    fn implied_price_usd(&self) -> Result<f64, std::num::ParseIntError> {
+    /// USDC paid per whole output token received. `out_decimals` varies per
+    /// token, so it is passed in rather than assumed (was hard-coded to SOL).
+    fn implied_price_usd(&self, out_decimals: u32) -> Result<f64, std::num::ParseIntError> {
         let usdc = self.in_amount.parse::<u64>()? as f64 / 10f64.powi(USDC_DECIMALS as i32);
-        let sol = self.out_amount.parse::<u64>()? as f64 / 10f64.powi(WSOL_DECIMALS as i32);
-        Ok(usdc / sol)
+        let tok = self.out_amount.parse::<u64>()? as f64 / 10f64.powi(out_decimals as i32);
+        Ok(usdc / tok)
     }
 
     fn route_signature(&self) -> String {
@@ -62,6 +77,7 @@ impl QuoteResponse {
 
 /// One quote's outcome, kept so the run can be written out and re-checked.
 struct Record {
+    symbol: &'static str,
     idx: usize,
     latency_ms: u128,
     price: Option<f64>,
@@ -71,14 +87,14 @@ struct Record {
 
 fn write_csv(path: &str, records: &[Record]) -> std::io::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
-    writeln!(w, "idx,latency_ms,price_usd,route,ok")?;
+    writeln!(w, "symbol,idx,latency_ms,price_usd,route,ok")?;
     for r in records {
         let price = r.price.map(|p| format!("{p:.6}")).unwrap_or_default();
         // route can contain commas — wrap it in quotes so the CSV stays valid
         writeln!(
             w,
-            "{},{},{},\"{}\",{}",
-            r.idx, r.latency_ms, price, r.route, r.ok
+            "{},{},{},{},\"{}\",{}",
+            r.symbol, r.idx, r.latency_ms, price, r.route, r.ok
         )?;
     }
     Ok(())
@@ -93,91 +109,106 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // usage: solana-quote-bench [n_requests] [out.csv]
+    // usage: solana-quote-bench [n_per_token] [out.csv]
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(20);
     let csv_path = std::env::args().nth(2);
 
-    let amount: u64 = 100_000_000; // $100 in USDC atomic units
-    let url = format!(
-        "https://lite-api.jup.ag/swap/v1/quote?inputMint={USDC}&outputMint={WSOL}&amount={amount}&slippageBps=50"
-    );
+    let amount: u64 = 100_000_000; // $100 in USDC atomic units (6 decimals)
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    println!("solana-quote-bench: {n} Jupiter quotes ($100 USDC -> wSOL)\n");
+    println!(
+        "solana-quote-bench: {n} quotes x {} tokens ($100 USDC notional)\n",
+        BASKET.len()
+    );
 
-    let mut records: Vec<Record> = Vec::with_capacity(n);
-    let mut latencies: Vec<u128> = Vec::with_capacity(n);
-    let mut prices: Vec<f64> = Vec::with_capacity(n);
-    let mut routes: HashMap<String, usize> = HashMap::new();
-    let mut failures = 0usize;
+    let mut all_records: Vec<Record> = Vec::with_capacity(n * BASKET.len());
 
-    for i in 1..=n {
-        let t0 = Instant::now();
-        let result: Result<QuoteResponse, reqwest::Error> = client
-            .get(&url)
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json());
-        let ms = t0.elapsed().as_millis();
+    for token in BASKET {
+        let url = format!(
+            "https://lite-api.jup.ag/swap/v1/quote?inputMint={USDC}&outputMint={}&amount={amount}&slippageBps=50",
+            token.mint
+        );
 
-        match result {
-            Ok(quote) => {
-                let price = quote.implied_price_usd()?;
-                let route = quote.route_signature();
-                latencies.push(ms);
-                prices.push(price);
-                *routes.entry(route.clone()).or_insert(0) += 1;
-                records.push(Record { idx: i, latency_ms: ms, price: Some(price), route, ok: true });
-                println!("  #{i:02}  {ms:>5} ms   ${price:>8.4}/SOL   impact {}%", quote.price_impact_pct);
-            }
-            Err(e) => {
-                failures += 1;
-                records.push(Record { idx: i, latency_ms: ms, price: None, route: String::new(), ok: false });
-                println!("  #{i:02}  {ms:>5} ms   FAIL: {e}");
+        let mut latencies: Vec<u128> = Vec::with_capacity(n);
+        let mut prices: Vec<f64> = Vec::with_capacity(n);
+        let mut impacts: Vec<f64> = Vec::with_capacity(n);
+        let mut routes: HashMap<String, usize> = HashMap::new();
+        let mut failures = 0usize;
+
+        println!("== {} ==", token.symbol);
+        for i in 1..=n {
+            let t0 = Instant::now();
+            let result: Result<QuoteResponse, reqwest::Error> = client
+                .get(&url)
+                .send()
+                .and_then(|r| r.error_for_status())
+                .and_then(|r| r.json());
+            let ms = t0.elapsed().as_millis();
+
+            match result {
+                Ok(quote) => {
+                    let price = quote.implied_price_usd(token.decimals)?;
+                    let route = quote.route_signature();
+                    // priceImpactPct arrives as a decimal fraction (0.001 = 0.1%)
+                    impacts.push(quote.price_impact_pct.parse().unwrap_or(0.0));
+                    latencies.push(ms);
+                    prices.push(price);
+                    *routes.entry(route.clone()).or_insert(0) += 1;
+                    all_records.push(Record { symbol: token.symbol, idx: i, latency_ms: ms, price: Some(price), route, ok: true });
+                }
+                Err(e) => {
+                    failures += 1;
+                    all_records.push(Record { symbol: token.symbol, idx: i, latency_ms: ms, price: None, route: String::new(), ok: false });
+                    eprintln!("  #{i:02} FAIL: {e}");
+                }
             }
         }
-    }
 
-    latencies.sort_unstable();
-    let ok = latencies.len();
-    println!("\nlatency ({ok} ok / {failures} fail):");
-    if ok > 0 {
-        let sum: u128 = latencies.iter().sum();
-        println!(
-            "  min {} · p50 {} · p90 {} · p99 {} · max {} · mean {} ms",
-            latencies[0],
-            percentile(&latencies, 50.0),
-            percentile(&latencies, 90.0),
-            percentile(&latencies, 99.0),
-            latencies[ok - 1],
-            sum / ok as u128
-        );
-    }
+        latencies.sort_unstable();
+        let ok = latencies.len();
+        if ok > 0 {
+            let sum: u128 = latencies.iter().sum();
+            println!(
+                "  latency: p50 {} · p90 {} · p99 {} · mean {} ms   ({ok} ok / {failures} fail)",
+                percentile(&latencies, 50.0),
+                percentile(&latencies, 90.0),
+                percentile(&latencies, 99.0),
+                sum / ok as u128,
+            );
+        } else {
+            println!("  latency: no successful quotes ({failures} fail)");
+        }
 
-    if !prices.is_empty() {
-        let lo = prices.iter().cloned().fold(f64::INFINITY, f64::min);
-        let hi = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let mean = prices.iter().sum::<f64>() / prices.len() as f64;
-        println!("\nimplied price: mean ${mean:.4} · range ${lo:.4}-${hi:.4} · spread {:.3}%",
-            (hi - lo) / mean * 100.0);
-    }
+        if !prices.is_empty() {
+            let lo = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let mean = prices.iter().sum::<f64>() / prices.len() as f64;
+            let mean_impact = impacts.iter().sum::<f64>() / impacts.len() as f64;
+            println!(
+                "  implied price: mean ${mean:.6} · spread {:.3}% · mean impact {:.4}%",
+                (hi - lo) / mean * 100.0,
+                mean_impact * 100.0
+            );
+        }
 
-    println!("\nroutes seen ({} distinct):", routes.len());
-    let mut by_count: Vec<_> = routes.iter().collect();
-    by_count.sort_by(|a, b| b.1.cmp(a.1));
-    for (route, count) in by_count {
-        println!("  {count:>3}x  {route}");
+        println!("  routes: {} distinct", routes.len());
+        let mut by_count: Vec<(&String, &usize)> = routes.iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(a.1));
+        for (route, count) in by_count.into_iter().take(3) {
+            println!("    {count:>3}x  {route}");
+        }
+        println!();
     }
 
     if let Some(path) = csv_path {
-        write_csv(&path, &records)?;
-        println!("\nwrote {} rows -> {path}", records.len());
+        write_csv(&path, &all_records)?;
+        println!("wrote {} rows -> {path}", all_records.len());
     }
 
     Ok(())
@@ -214,7 +245,7 @@ mod tests {
             price_impact_pct: "0".to_string(),
             route_plan: vec![],
         };
-        let price = q.implied_price_usd().unwrap();
+        let price = q.implied_price_usd(9).unwrap();
         assert!((price - 100.0).abs() < 1e-9, "expected ~100, got {price}");
     }
 }
